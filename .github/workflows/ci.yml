@@ -20,5 +20,5 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: cargo build --release
+      - run: cargo build --release --features loadable-extension
       - run: python3 metadata.py target/release/libduckdb_raster.so -o raster.duckdb_extension --duckdb-version v1.5.4

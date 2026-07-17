@@ -9,7 +9,9 @@ use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
 use duckdb::vscalar::arrow::{ArrowFunctionSignature, VArrowScalar};
 use duckdb::vtab::arrow::record_batch_to_duckdb_data_chunk;
 use duckdb::vtab::{BindInfo, InitInfo, TableFunctionInfo, VTab};
-use duckdb::{duckdb_entrypoint_c_api, Connection, Result};
+use duckdb::{Connection, Result};
+#[cfg(feature = "loadable-extension")]
+use duckdb::duckdb_entrypoint_c_api;
 use std::error::Error;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -124,7 +126,7 @@ mod raster {
 
 // ─── VArrowScalar implementations ──────────────────────────────────────────
 
-struct S2CellId;
+pub struct S2CellId;
 impl VArrowScalar for S2CellId {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
@@ -140,7 +142,7 @@ impl VArrowScalar for S2CellId {
     }
 }
 
-struct S2Contains;
+pub struct S2Contains;
 impl VArrowScalar for S2Contains {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
@@ -156,7 +158,7 @@ impl VArrowScalar for S2Contains {
     }
 }
 
-struct S2Distance;
+pub struct S2Distance;
 impl VArrowScalar for S2Distance {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
@@ -171,7 +173,7 @@ impl VArrowScalar for S2Distance {
     }
 }
 
-struct S2Area;
+pub struct S2Area;
 impl VArrowScalar for S2Area {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
@@ -186,7 +188,7 @@ impl VArrowScalar for S2Area {
     }
 }
 
-struct S2Parent;
+pub struct S2Parent;
 impl VArrowScalar for S2Parent {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
@@ -201,7 +203,7 @@ impl VArrowScalar for S2Parent {
     }
 }
 
-struct StTransformCoords;
+pub struct StTransformCoords;
 impl VArrowScalar for StTransformCoords {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
@@ -218,7 +220,7 @@ impl VArrowScalar for StTransformCoords {
     }
 }
 
-struct StTransform;
+pub struct StTransform;
 impl VArrowScalar for StTransform {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
@@ -234,7 +236,7 @@ impl VArrowScalar for StTransform {
     }
 }
 
-struct RsValue;
+pub struct RsValue;
 impl VArrowScalar for RsValue {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
@@ -309,6 +311,7 @@ impl VTab for RsMetadataVTab {
 
 // ─── Entrypoint ────────────────────────────────────────────────────────────
 
+#[cfg(feature = "loadable-extension")]
 #[duckdb_entrypoint_c_api(ext_name = "raster")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     con.register_scalar_function::<S2CellId>("s2_cell_id")?;

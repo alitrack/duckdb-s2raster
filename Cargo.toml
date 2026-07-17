@@ -8,10 +8,10 @@ repository = "https://github.com/alitrack/duckdb-raster"
 
 [lib]
 name = "duckdb_raster"
-crate-type = ["cdylib"]
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar", "vscalar-arrow"] }
+duckdb = { version = "~1.10504.0", features = ["vscalar", "vscalar-arrow"] }
 arrow = "58"
 s2 = "0.1"
 geo = "0.29"
@@ -23,6 +23,7 @@ thiserror = "2"
 
 [features]
 default = []
+loadable-extension = ["duckdb/loadable-extension"]
 test-bundled = ["duckdb/bundled"]
 
 [[test]]
