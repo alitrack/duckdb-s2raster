@@ -53,7 +53,102 @@ fn s2_parent_impl(cell_id: i64, level: i64) -> i64 {
     s2::cellid::CellID(cell_id as u64).parent(level as u64).0 as i64
 }
 
-// ─── ST_Transform ───────────────────────────────────────────────────────────
+fn s2_cell_level_impl(cell_id: i64) -> i32 {
+    s2::cellid::CellID(cell_id as u64).level() as i32
+}
+
+fn s2_to_geo_impl(cell_id: i64) -> String {
+    let cell: s2::cell::Cell = s2::cellid::CellID(cell_id as u64).into();
+    let center = cell.center();
+    let ll: s2::latlng::LatLng = center.into();
+    format!("POINT({:.7} {:.7})", ll.lng.deg(), ll.lat.deg())
+}
+
+fn s2_cell_to_hex_impl(cell_id: i64) -> String {
+    s2::cellid::CellID(cell_id as u64).to_token()
+}
+
+fn s2_hex_to_cell_impl(hex: &str) -> i64 {
+    s2::cellid::CellID::from_token(hex).0 as i64
+}
+
+pub struct S2CellLevel;
+impl VArrowScalar for S2CellLevel {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let cell = input.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut b = arrow::array::Int32Array::builder(cell.len());
+        for i in 0..cell.len() {
+            b.append_value(s2_cell_level_impl(cell.value(i)));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Int64],
+            DataType::Int32,
+        )]
+    }
+}
+
+pub struct S2ToGeo;
+impl VArrowScalar for S2ToGeo {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let cell = input.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut b = StringBuilder::with_capacity(cell.len(), cell.len() * 40);
+        for i in 0..cell.len() {
+            b.append_value(s2_to_geo_impl(cell.value(i)));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Int64],
+            DataType::Utf8,
+        )]
+    }
+}
+
+pub struct S2CellToHex;
+impl VArrowScalar for S2CellToHex {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let cell = input.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut b = StringBuilder::with_capacity(cell.len(), cell.len() * 16);
+        for i in 0..cell.len() {
+            b.append_value(s2_cell_to_hex_impl(cell.value(i)));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Int64],
+            DataType::Utf8,
+        )]
+    }
+}
+
+pub struct S2HexToCell;
+impl VArrowScalar for S2HexToCell {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let hex = input.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let mut b = Int64Array::builder(hex.len());
+        for i in 0..hex.len() {
+            b.append_value(s2_hex_to_cell_impl(hex.value(i)));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8],
+            DataType::Int64,
+        )]
+    }
+}
+
+// ─── St Transform ───────────────────────────────────────────────────────────
 
 fn st_transform_coords_impl(x: f64, y: f64, from_crs: &str, to_crs: &str) -> String {
     use proj::Proj;
@@ -309,6 +404,148 @@ impl VTab for RsMetadataVTab {
     }
 }
 
+// ─── Table Function: s2_covering(wkt, min_level, max_level) → table(cell_id) ─
+
+pub struct S2CoveringVTab;
+#[repr(C)]
+pub struct S2CoveringInit {
+    done: AtomicBool,
+}
+#[repr(C)]
+pub struct S2CoveringBind {
+    cells: Vec<i64>,
+}
+
+fn covering_from_wkt(wkt_str: &str, min_level: i32, max_level: i32) -> Vec<i64> {
+    use geo::algorithm::BoundingRect;
+    use geo::Geometry;
+    use s2::region::RegionCoverer;
+    use wkt::TryFromWkt;
+
+    let geom = match Geometry::<f64>::try_from_wkt_str(wkt_str) {
+        Ok(g) => g,
+        Err(_) => return vec![],
+    };
+    let bbox = match geom.bounding_rect() {
+        Some(r) => r,
+        None => return vec![],
+    };
+    let rect = s2::rect::Rect::from_degrees(bbox.min().y, bbox.min().x, bbox.max().y, bbox.max().x);
+    let coverer = RegionCoverer {
+        min_level: min_level.max(0) as u8,
+        max_level: max_level.min(30) as u8,
+        level_mod: 1,
+        max_cells: 64,
+    };
+    let cu = coverer.covering(&rect);
+    cu.0.iter().map(|cid| cid.0 as i64).collect()
+}
+
+impl VTab for S2CoveringVTab {
+    type BindData = S2CoveringBind;
+    type InitData = S2CoveringInit;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
+        bind.add_result_column("cell_id", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        let wkt = bind.get_parameter(0).to_string();
+        let min_lvl: i32 = bind.get_parameter(1).to_int32();
+        let max_lvl: i32 = bind.get_parameter(2).to_int32();
+        let cells = covering_from_wkt(&wkt, min_lvl, max_lvl);
+        Ok(S2CoveringBind { cells })
+    }
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
+        Ok(S2CoveringInit {
+            done: AtomicBool::new(false),
+        })
+    }
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn Error>> {
+        if func.get_init_data().done.swap(true, Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        let bd = func.get_bind_data();
+        let cell_ids: Int64Array = bd.cells.iter().map(|&c| c).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "cell_id",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(cell_ids)],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Varchar),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+}
+
+// ─── Table Function: s2_children(cell_id, level) → table(child_id) ─
+
+pub struct S2ChildrenVTab;
+#[repr(C)]
+pub struct S2ChildrenInit {
+    done: AtomicBool,
+}
+#[repr(C)]
+pub struct S2ChildrenBind {
+    children: Vec<i64>,
+}
+
+impl VTab for S2ChildrenVTab {
+    type BindData = S2ChildrenBind;
+    type InitData = S2ChildrenInit;
+
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
+        bind.add_result_column("child_id", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        let cell_id: i64 = bind.get_parameter(0).to_int64();
+        let level: u64 = bind.get_parameter(1).to_int32() as u64;
+        let cid = s2::cellid::CellID(cell_id as u64);
+        let children: Vec<i64> = cid.child_iter_at_level(level).map(|c| c.0 as i64).collect();
+        Ok(S2ChildrenBind { children })
+    }
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
+        Ok(S2ChildrenInit {
+            done: AtomicBool::new(false),
+        })
+    }
+    fn func(
+        func: &TableFunctionInfo<Self>,
+        output: &mut DataChunkHandle,
+    ) -> Result<(), Box<dyn Error>> {
+        if func.get_init_data().done.swap(true, Ordering::Relaxed) {
+            output.set_len(0);
+            return Ok(());
+        }
+        let bd = func.get_bind_data();
+        let ids: Int64Array = bd.children.iter().map(|&c| c).collect();
+        let batch = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "child_id",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(ids)],
+        )?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![
+            LogicalTypeHandle::from(LogicalTypeId::Bigint),
+            LogicalTypeHandle::from(LogicalTypeId::Integer),
+        ])
+    }
+}
+
 // ─── Entrypoint ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "loadable-extension")]
@@ -319,9 +556,15 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_scalar_function::<S2Distance>("s2_distance_meters")?;
     con.register_scalar_function::<S2Area>("s2_area_m2")?;
     con.register_scalar_function::<S2Parent>("s2_parent")?;
+    con.register_scalar_function::<S2CellLevel>("s2_cell_level")?;
+    con.register_scalar_function::<S2ToGeo>("s2_to_geo")?;
+    con.register_scalar_function::<S2CellToHex>("s2_cell_to_hex")?;
+    con.register_scalar_function::<S2HexToCell>("s2_hex_to_cell")?;
     con.register_scalar_function::<StTransformCoords>("st_transform_coords")?;
     con.register_scalar_function::<StTransform>("st_transform")?;
     con.register_scalar_function::<RsValue>("rs_value")?;
     con.register_table_function::<RsMetadataVTab>("rs_metadata")?;
+    con.register_table_function::<S2CoveringVTab>("s2_covering")?;
+    con.register_table_function::<S2ChildrenVTab>("s2_children")?;
     Ok(())
 }

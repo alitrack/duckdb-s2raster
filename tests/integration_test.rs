@@ -12,10 +12,16 @@ fn setup_conn() -> Result<Connection, Box<dyn Error>> {
     conn.register_scalar_function::<duckdb_raster::S2Distance>("s2_distance_meters")?;
     conn.register_scalar_function::<duckdb_raster::S2Area>("s2_area_m2")?;
     conn.register_scalar_function::<duckdb_raster::S2Parent>("s2_parent")?;
+    conn.register_scalar_function::<duckdb_raster::S2CellLevel>("s2_cell_level")?;
+    conn.register_scalar_function::<duckdb_raster::S2ToGeo>("s2_to_geo")?;
+    conn.register_scalar_function::<duckdb_raster::S2CellToHex>("s2_cell_to_hex")?;
+    conn.register_scalar_function::<duckdb_raster::S2HexToCell>("s2_hex_to_cell")?;
     conn.register_scalar_function::<duckdb_raster::StTransformCoords>("st_transform_coords")?;
     conn.register_scalar_function::<duckdb_raster::StTransform>("st_transform")?;
     conn.register_scalar_function::<duckdb_raster::RsValue>("rs_value")?;
     conn.register_table_function::<duckdb_raster::RsMetadataVTab>("rs_metadata")?;
+    conn.register_table_function::<duckdb_raster::S2CoveringVTab>("s2_covering")?;
+    conn.register_table_function::<duckdb_raster::S2ChildrenVTab>("s2_children")?;
     Ok(conn)
 }
 
@@ -106,4 +112,73 @@ fn test_s2_area() {
         )
         .unwrap();
     assert!(area > 0.0, "area: {}", area);
+}
+
+#[test]
+fn test_s2_cell_level() {
+    let conn = setup_conn().unwrap();
+    let cell: i64 = conn
+        .query_row("SELECT s2_cell_id(39.9, 116.4, 10)", [], |row| row.get(0))
+        .unwrap();
+    let level: i32 = conn
+        .query_row(&format!("SELECT s2_cell_level({})", cell), [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(level, 10);
+}
+
+#[test]
+fn test_s2_to_geo() {
+    let conn = setup_conn().unwrap();
+    let cell: i64 = conn
+        .query_row("SELECT s2_cell_id(39.9, 116.4, 10)", [], |row| row.get(0))
+        .unwrap();
+    let geo: String = conn
+        .query_row(&format!("SELECT s2_to_geo({})", cell), [], |row| row.get(0))
+        .unwrap();
+    assert!(geo.starts_with("POINT"));
+}
+
+#[test]
+fn test_s2_cell_to_hex_roundtrip() {
+    let conn = setup_conn().unwrap();
+    let cell: i64 = conn
+        .query_row("SELECT s2_cell_id(39.9, 116.4, 10)", [], |row| row.get(0))
+        .unwrap();
+    let hex: String = conn
+        .query_row(&format!("SELECT s2_cell_to_hex({})", cell), [], |row| row.get(0))
+        .unwrap();
+    let back: i64 = conn
+        .query_row(&format!("SELECT s2_hex_to_cell('{}')", hex), [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(cell, back);
+}
+
+#[test]
+fn test_s2_covering() {
+    let conn = setup_conn().unwrap();
+    // Cover a small polygon in Beijing at level 8
+    let count: usize = conn
+        .query_row(
+            "SELECT COUNT(*) FROM s2_covering('POLYGON((116.0 39.0, 117.0 39.0, 117.0 40.0, 116.0 40.0, 116.0 39.0))', 8, 10)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(count > 0, "covering should return cells");
+}
+
+#[test]
+fn test_s2_children() {
+    let conn = setup_conn().unwrap();
+    let cell: i64 = conn
+        .query_row("SELECT s2_cell_id(39.9, 116.4, 8)", [], |row| row.get(0))
+        .unwrap();
+    let count: usize = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM s2_children({}, 12)", cell),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 256, "cell at level 8 has 4^(12-8)=256 children at level 12");
 }
