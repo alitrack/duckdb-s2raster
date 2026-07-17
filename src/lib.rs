@@ -2,7 +2,7 @@
 //! Ported from SedonaDB algorithms, pure Rust, zero system deps.
 
 use arrow::array::{
-    Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray,
+    Array, BooleanArray, Float64Array, Int64Array, RecordBatch, StringArray, StringBuilder,
 };
 use arrow::datatypes::{DataType, Field, Schema};
 use duckdb::core::{DataChunkHandle, LogicalTypeHandle, LogicalTypeId};
@@ -55,16 +55,20 @@ fn s2_parent_impl(cell_id: i64, level: i64) -> i64 {
 
 fn st_transform_coords_impl(x: f64, y: f64, from_crs: &str, to_crs: &str) -> String {
     use proj::Proj;
-    Proj::new_known_crs(from_crs, to_crs, None)
-        .and_then(|p| p.convert((x, y)))
-        .map(|(nx, ny)| format!("POINT({} {})", nx, ny))
-        .unwrap_or_else(|e| format!("ERROR: {}", e))
+    match Proj::new_known_crs(from_crs, to_crs, None) {
+        Ok(p) => match p.convert((x, y)) {
+            Ok((nx, ny)) => format!("POINT({} {})", nx, ny),
+            Err(e) => format!("ERROR: {}", e),
+        },
+        Err(e) => format!("ERROR: {}", e),
+    }
 }
 
 fn st_transform_impl(wkt_str: &str, from_crs: &str, to_crs: &str) -> String {
-    use geo::{MapCoords, TryFromWkt};
+    use geo::MapCoords;
     use proj::Proj;
-    let geom = match geo::geometry::Geometry::try_from_wkt_str(wkt_str) {
+    use wkt::{ToWkt, TryFromWkt};
+    let geom = match geo::geometry::Geometry::<f64>::try_from_wkt_str(wkt_str) {
         Ok(g) => g,
         Err(e) => return format!("ERROR: {}", e),
     };
@@ -72,9 +76,8 @@ fn st_transform_impl(wkt_str: &str, from_crs: &str, to_crs: &str) -> String {
         Ok(p) => p,
         Err(e) => return format!("ERROR: {}", e),
     };
-    geom.map_coords(|c| proj.convert(c).unwrap_or(c))
-        .map(|g| g.to_wkt())
-        .unwrap_or_else(|_| "ERROR: transform failed".into())
+    let transformed = geom.map_coords(|c| proj.convert(c).unwrap_or(c));
+    transformed.to_wkt().to_string()
 }
 
 // ─── GeoTIFF Raster ────────────────────────────────────────────────────────
@@ -111,7 +114,7 @@ mod raster {
             + band.saturating_sub(1) as usize * (width as usize * height as usize);
         match img {
             DecodingResult::F64(data) => Ok(*data.get(idx).unwrap_or(&f64::NAN)),
-            DecodingResult::F32(data) => Ok(*data.get(idx).unwrap_or(&f32::NAN) as f64),
+            DecodingResult::F32(data) => Ok(*data.get(idx).unwrap_or(&0.0) as f64),
             DecodingResult::U16(data) => Ok(*data.get(idx).unwrap_or(&0) as f64),
             DecodingResult::U8(data) => Ok(*data.get(idx).unwrap_or(&0) as f64),
             _ => Ok(f64::NAN),
@@ -121,7 +124,6 @@ mod raster {
 
 // ─── VArrowScalar implementations ──────────────────────────────────────────
 
-// s2_cell_id(lat, lon, level) → cell_id
 struct S2CellId;
 impl VArrowScalar for S2CellId {
     type State = ();
@@ -129,21 +131,15 @@ impl VArrowScalar for S2CellId {
         let lat = input.column(0).as_any().downcast_ref::<Float64Array>().unwrap();
         let lon = input.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
         let lvl = input.column(2).as_any().downcast_ref::<Int64Array>().unwrap();
-        let mut out = Int64Array::builder(lat.len());
-        for i in 0..lat.len() {
-            out.append_value(s2_cell_id_impl(lat.value(i), lon.value(i), lvl.value(i)));
-        }
-        Ok(Arc::new(out.finish()))
+        let mut b = Int64Array::builder(lat.len());
+        for i in 0..lat.len() { b.append_value(s2_cell_id_impl(lat.value(i), lon.value(i), lvl.value(i))); }
+        Ok(Arc::new(b.finish()))
     }
     fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![DataType::Float64, DataType::Float64, DataType::Int64],
-            DataType::Int64,
-        )]
+        vec![ArrowFunctionSignature::exact(vec![DataType::Float64, DataType::Float64, DataType::Int64], DataType::Int64)]
     }
 }
 
-// s2_contains(cell_id, lat, lon) → bool
 struct S2Contains;
 impl VArrowScalar for S2Contains {
     type State = ();
@@ -151,84 +147,60 @@ impl VArrowScalar for S2Contains {
         let cell = input.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let lat = input.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
         let lon = input.column(2).as_any().downcast_ref::<Float64Array>().unwrap();
-        let mut out = BooleanArray::builder(lat.len());
-        for i in 0..lat.len() {
-            out.append_value(s2_contains_impl(cell.value(i), lat.value(i), lon.value(i)));
-        }
-        Ok(Arc::new(out.finish()))
+        let mut b = BooleanArray::builder(lat.len());
+        for i in 0..lat.len() { b.append_value(s2_contains_impl(cell.value(i), lat.value(i), lon.value(i))); }
+        Ok(Arc::new(b.finish()))
     }
     fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![DataType::Int64, DataType::Float64, DataType::Float64],
-            DataType::Boolean,
-        )]
+        vec![ArrowFunctionSignature::exact(vec![DataType::Int64, DataType::Float64, DataType::Float64], DataType::Boolean)]
     }
 }
 
-// s2_distance_meters(cell1, cell2) → meters
 struct S2Distance;
 impl VArrowScalar for S2Distance {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
         let c1 = input.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let c2 = input.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let mut out = Float64Array::builder(c1.len());
-        for i in 0..c1.len() {
-            out.append_value(s2_distance_meters_impl(c1.value(i), c2.value(i)));
-        }
-        Ok(Arc::new(out.finish()))
+        let mut b = Float64Array::builder(c1.len());
+        for i in 0..c1.len() { b.append_value(s2_distance_meters_impl(c1.value(i), c2.value(i))); }
+        Ok(Arc::new(b.finish()))
     }
     fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![DataType::Int64, DataType::Int64],
-            DataType::Float64,
-        )]
+        vec![ArrowFunctionSignature::exact(vec![DataType::Int64, DataType::Int64], DataType::Float64)]
     }
 }
 
-// s2_area_m2(cell_id, level) → area
 struct S2Area;
 impl VArrowScalar for S2Area {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
         let cell = input.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let lvl = input.column(1).as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
-        let mut out = Float64Array::builder(cell.len());
-        for i in 0..cell.len() {
-            out.append_value(s2_area_m2_impl(cell.value(i), lvl.value(i)));
-        }
-        Ok(Arc::new(out.finish()))
+        let mut b = Float64Array::builder(cell.len());
+        for i in 0..cell.len() { b.append_value(s2_area_m2_impl(cell.value(i), lvl.value(i))); }
+        Ok(Arc::new(b.finish()))
     }
     fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![DataType::Int64, DataType::Int32],
-            DataType::Float64,
-        )]
+        vec![ArrowFunctionSignature::exact(vec![DataType::Int64, DataType::Int32], DataType::Float64)]
     }
 }
 
-// s2_parent(cell_id, level) → parent_cell_id
 struct S2Parent;
 impl VArrowScalar for S2Parent {
     type State = ();
     fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
         let cell = input.column(0).as_any().downcast_ref::<Int64Array>().unwrap();
         let lvl = input.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
-        let mut out = Int64Array::builder(cell.len());
-        for i in 0..cell.len() {
-            out.append_value(s2_parent_impl(cell.value(i), lvl.value(i)));
-        }
-        Ok(Arc::new(out.finish()))
+        let mut b = Int64Array::builder(cell.len());
+        for i in 0..cell.len() { b.append_value(s2_parent_impl(cell.value(i), lvl.value(i))); }
+        Ok(Arc::new(b.finish()))
     }
     fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![DataType::Int64, DataType::Int64],
-            DataType::Int64,
-        )]
+        vec![ArrowFunctionSignature::exact(vec![DataType::Int64, DataType::Int64], DataType::Int64)]
     }
 }
 
-// st_transform_coords(x, y, from_crs, to_crs) → wkt_point
 struct StTransformCoords;
 impl VArrowScalar for StTransformCoords {
     type State = ();
@@ -237,21 +209,15 @@ impl VArrowScalar for StTransformCoords {
         let y = input.column(1).as_any().downcast_ref::<Float64Array>().unwrap();
         let from = input.column(2).as_any().downcast_ref::<StringArray>().unwrap();
         let to = input.column(3).as_any().downcast_ref::<StringArray>().unwrap();
-        let mut out = StringArray::builder(x.len());
-        for i in 0..x.len() {
-            out.append_value(st_transform_coords_impl(x.value(i), y.value(i), from.value(i), to.value(i)));
-        }
-        Ok(Arc::new(out.finish()))
+        let mut b = StringBuilder::with_capacity(x.len(), x.len() * 20);
+        for i in 0..x.len() { b.append_value(st_transform_coords_impl(x.value(i), y.value(i), from.value(i), to.value(i))); }
+        Ok(Arc::new(b.finish()))
     }
     fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![DataType::Float64, DataType::Float64, DataType::Utf8, DataType::Utf8],
-            DataType::Utf8,
-        )]
+        vec![ArrowFunctionSignature::exact(vec![DataType::Float64, DataType::Float64, DataType::Utf8, DataType::Utf8], DataType::Utf8)]
     }
 }
 
-// st_transform(wkt, from_crs, to_crs) → wkt
 struct StTransform;
 impl VArrowScalar for StTransform {
     type State = ();
@@ -259,21 +225,15 @@ impl VArrowScalar for StTransform {
         let wkt = input.column(0).as_any().downcast_ref::<StringArray>().unwrap();
         let from = input.column(1).as_any().downcast_ref::<StringArray>().unwrap();
         let to = input.column(2).as_any().downcast_ref::<StringArray>().unwrap();
-        let mut out = StringArray::builder(wkt.len());
-        for i in 0..wkt.len() {
-            out.append_value(st_transform_impl(wkt.value(i), from.value(i), to.value(i)));
-        }
-        Ok(Arc::new(out.finish()))
+        let mut b = StringBuilder::with_capacity(wkt.len(), wkt.len() * 100);
+        for i in 0..wkt.len() { b.append_value(st_transform_impl(wkt.value(i), from.value(i), to.value(i))); }
+        Ok(Arc::new(b.finish()))
     }
     fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![DataType::Utf8, DataType::Utf8, DataType::Utf8],
-            DataType::Utf8,
-        )]
+        vec![ArrowFunctionSignature::exact(vec![DataType::Utf8, DataType::Utf8, DataType::Utf8], DataType::Utf8)]
     }
 }
 
-// rs_value(path, band, col, row) → pixel_value
 struct RsValue;
 impl VArrowScalar for RsValue {
     type State = ();
@@ -282,34 +242,23 @@ impl VArrowScalar for RsValue {
         let band = input.column(1).as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
         let col = input.column(2).as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
         let row = input.column(3).as_any().downcast_ref::<arrow::array::Int32Array>().unwrap();
-        let mut out = Float64Array::builder(path.len());
+        let mut b = Float64Array::builder(path.len());
         for i in 0..path.len() {
-            out.append_value(
-                raster::read_pixel(
-                    path.value(i),
-                    band.value(i).max(1) as u32,
-                    col.value(i).max(0) as u32,
-                    row.value(i).max(0) as u32,
-                )
-                .unwrap_or(f64::NAN),
-            );
+            b.append_value(raster::read_pixel(path.value(i), band.value(i).max(1) as u32, col.value(i).max(0) as u32, row.value(i).max(0) as u32).unwrap_or(f64::NAN));
         }
-        Ok(Arc::new(out.finish()))
+        Ok(Arc::new(b.finish()))
     }
     fn signatures() -> Vec<ArrowFunctionSignature> {
-        vec![ArrowFunctionSignature::exact(
-            vec![DataType::Utf8, DataType::Int32, DataType::Int32, DataType::Int32],
-            DataType::Float64,
-        )]
+        vec![ArrowFunctionSignature::exact(vec![DataType::Utf8, DataType::Int32, DataType::Int32, DataType::Int32], DataType::Float64)]
     }
 }
 
-// ─── Table Function: rs_metadata ───────────────────────────────────────────
+// ─── Table Function: rs_metadata(path) → (path, width, height, bands, crs) ─
 
 pub struct RsMetadataVTab;
 #[repr(C)] pub struct RsMetaInit { done: AtomicBool }
 #[repr(C)] pub struct RsMetaBind { row: Option<MetaRow>, schema: Arc<Schema> }
-struct MetaRow { path: String, width: u32, height: u32, bands: u32, crs: String }
+struct MetaRow { path: String, width: i32, height: i32, bands: i32, crs: String }
 
 impl VTab for RsMetadataVTab {
     type BindData = RsMetaBind;
@@ -321,12 +270,10 @@ impl VTab for RsMetadataVTab {
         bind.add_result_column("height", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("bands", LogicalTypeHandle::from(LogicalTypeId::Integer));
         bind.add_result_column("crs", LogicalTypeHandle::from(LogicalTypeId::Varchar));
-
-        let path = bind.get_parameter::<String>(0)?;
+        let path = bind.get_parameter(0).to_string();
         let (w, h, b, crs) = raster::read_metadata(&path)?;
-
         Ok(RsMetaBind {
-            row: Some(MetaRow { path, width: w, height: h, bands: b, crs }),
+            row: Some(MetaRow { path, width: w as i32, height: h as i32, bands: b as i32, crs }),
             schema: Arc::new(Schema::new(vec![
                 Field::new("path", DataType::Utf8, false),
                 Field::new("width", DataType::Int32, false),
@@ -336,31 +283,25 @@ impl VTab for RsMetadataVTab {
             ])),
         })
     }
-
     fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> {
         Ok(RsMetaInit { done: AtomicBool::new(false) })
     }
-
     fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
-        if func.get_init_data().done.swap(true, Ordering::Relaxed) {
-            output.set_len(0);
-            return Ok(());
-        }
+        if func.get_init_data().done.swap(true, Ordering::Relaxed) { output.set_len(0); return Ok(()); }
         let bd = func.get_bind_data();
         let r = bd.row.as_ref().unwrap();
         use arrow::array::Int32Array;
         let arrays: Vec<Arc<dyn Array>> = vec![
             Arc::new(StringArray::from(vec![r.path.as_str()])),
-            Arc::new(Int32Array::from(vec![r.width as i32])),
-            Arc::new(Int32Array::from(vec![r.height as i32])),
-            Arc::new(Int32Array::from(vec![r.bands as i32])),
+            Arc::new(Int32Array::from(vec![r.width])),
+            Arc::new(Int32Array::from(vec![r.height])),
+            Arc::new(Int32Array::from(vec![r.bands])),
             Arc::new(StringArray::from(vec![r.crs.as_str()])),
         ];
         let batch = RecordBatch::try_new(bd.schema.clone(), arrays)?;
         record_batch_to_duckdb_data_chunk(&batch, output)?;
         Ok(())
     }
-
     fn parameters() -> Option<Vec<LogicalTypeHandle>> {
         Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar)])
     }
