@@ -11,7 +11,7 @@ name = "duckdb_raster"
 crate-type = ["cdylib"]
 
 [dependencies]
-duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar"] }
+duckdb = { version = "~1.10504.0", features = ["loadable-extension", "vscalar", "vscalar-arrow"] }
 arrow = "58"
 s2 = "0.1"
 geo = "0.29"
