@@ -22,6 +22,17 @@ fn setup_conn() -> Result<Connection, Box<dyn Error>> {
     conn.register_table_function::<duckdb_raster::RsMetadataVTab>("rs_metadata")?;
     conn.register_table_function::<duckdb_raster::S2CoveringVTab>("s2_covering")?;
     conn.register_table_function::<duckdb_raster::S2ChildrenVTab>("s2_children")?;
+    conn.register_table_function::<duckdb_raster::S2NeighborsVTab>("s2_cell_neighbors")?;
+    conn.register_table_function::<duckdb_raster::RsStatsVTab>("rs_stats")?;
+    conn.register_table_function::<duckdb_raster::RsHistogramVTab>("rs_histogram")?;
+    conn.register_scalar_function::<duckdb_raster::RsBandCount>("rs_band_count")?;
+    conn.register_scalar_function::<duckdb_raster::RsWidth>("rs_width")?;
+    conn.register_scalar_function::<duckdb_raster::RsHeight>("rs_height")?;
+    conn.register_scalar_function::<duckdb_raster::RsGeoTransform>("rs_geo_transform")?;
+    conn.register_scalar_function::<duckdb_raster::RsPixelToWorld>("rs_pixel_to_world")?;
+    conn.register_scalar_function::<duckdb_raster::RsWorldToPixel>("rs_world_to_pixel")?;
+    conn.register_scalar_function::<duckdb_raster::S2CellVertex>("s2_cell_vertex")?;
+    conn.register_scalar_function::<duckdb_raster::S2CellIdFromPoint>("s2_cell_id_from_point")?;
     Ok(conn)
 }
 
@@ -76,11 +87,9 @@ fn test_s2_parent() {
         .query_row("SELECT s2_cell_id(39.9, 116.4, 10)", [], |row| row.get(0))
         .unwrap();
     let parent: i64 = conn
-        .query_row(
-            &format!("SELECT s2_parent({}, 8)", cell),
-            [],
-            |row| row.get(0),
-        )
+        .query_row(&format!("SELECT s2_parent({}, 8)", cell), [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(parent > 0 && parent != cell);
 }
@@ -105,11 +114,9 @@ fn test_s2_area() {
         .query_row("SELECT s2_cell_id(39.9, 116.4, 10)", [], |row| row.get(0))
         .unwrap();
     let area: f64 = conn
-        .query_row(
-            &format!("SELECT s2_area_m2({}, 10)", cell),
-            [],
-            |row| row.get(0),
-        )
+        .query_row(&format!("SELECT s2_area_m2({}, 10)", cell), [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert!(area > 0.0, "area: {}", area);
 }
@@ -121,7 +128,9 @@ fn test_s2_cell_level() {
         .query_row("SELECT s2_cell_id(39.9, 116.4, 10)", [], |row| row.get(0))
         .unwrap();
     let level: i32 = conn
-        .query_row(&format!("SELECT s2_cell_level({})", cell), [], |row| row.get(0))
+        .query_row(&format!("SELECT s2_cell_level({})", cell), [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(level, 10);
 }
@@ -145,10 +154,14 @@ fn test_s2_cell_to_hex_roundtrip() {
         .query_row("SELECT s2_cell_id(39.9, 116.4, 10)", [], |row| row.get(0))
         .unwrap();
     let hex: String = conn
-        .query_row(&format!("SELECT s2_cell_to_hex({})", cell), [], |row| row.get(0))
+        .query_row(&format!("SELECT s2_cell_to_hex({})", cell), [], |row| {
+            row.get(0)
+        })
         .unwrap();
     let back: i64 = conn
-        .query_row(&format!("SELECT s2_hex_to_cell('{}')", hex), [], |row| row.get(0))
+        .query_row(&format!("SELECT s2_hex_to_cell('{}')", hex), [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(cell, back);
 }
@@ -180,5 +193,51 @@ fn test_s2_children() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(count, 256, "cell at level 8 has 4^(12-8)=256 children at level 12");
+    assert_eq!(
+        count, 256,
+        "cell at level 8 has 4^(12-8)=256 children at level 12"
+    );
+}
+
+#[test]
+fn test_s2_cell_vertex() {
+    let conn = setup_conn().unwrap();
+    let cell: i64 = conn
+        .query_row("SELECT s2_cell_id(39.9, 116.4, 10)", [], |row| row.get(0))
+        .unwrap();
+    let v: String = conn
+        .query_row(&format!("SELECT s2_cell_vertex({}, 0)", cell), [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(v.starts_with("POINT"));
+}
+
+#[test]
+fn test_s2_cell_id_from_point() {
+    let conn = setup_conn().unwrap();
+    let cell: i64 = conn
+        .query_row(
+            "SELECT s2_cell_id_from_point('POINT(116.4 39.9)')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(cell > 0);
+}
+
+#[test]
+fn test_s2_cell_neighbors() {
+    let conn = setup_conn().unwrap();
+    let cell: i64 = conn
+        .query_row("SELECT s2_cell_id(39.9, 116.4, 8)", [], |row| row.get(0))
+        .unwrap();
+    let count: usize = conn
+        .query_row(
+            &format!("SELECT COUNT(*) FROM s2_cell_neighbors({})", cell),
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 4, "each cell has 4 edge neighbors");
 }
