@@ -7,32 +7,38 @@ use std::error::Error;
 fn setup_conn() -> Result<Connection, Box<dyn Error>> {
     let conn = Connection::open_in_memory()?;
     // Register all extension functions manually (bundled feature = no auto-load)
-    conn.register_scalar_function::<duckdb_raster::S2CellId>("s2_cell_id")?;
-    conn.register_scalar_function::<duckdb_raster::S2Contains>("s2_contains")?;
-    conn.register_scalar_function::<duckdb_raster::S2Distance>("s2_distance_meters")?;
-    conn.register_scalar_function::<duckdb_raster::S2Area>("s2_area_m2")?;
-    conn.register_scalar_function::<duckdb_raster::S2Parent>("s2_parent")?;
-    conn.register_scalar_function::<duckdb_raster::S2CellLevel>("s2_cell_level")?;
-    conn.register_scalar_function::<duckdb_raster::S2ToGeo>("s2_to_geo")?;
-    conn.register_scalar_function::<duckdb_raster::S2CellToHex>("s2_cell_to_hex")?;
-    conn.register_scalar_function::<duckdb_raster::S2HexToCell>("s2_hex_to_cell")?;
-    conn.register_scalar_function::<duckdb_raster::StTransformCoords>("st_transform_coords")?;
-    conn.register_scalar_function::<duckdb_raster::StTransform>("st_transform")?;
-    conn.register_scalar_function::<duckdb_raster::RsValue>("rs_value")?;
-    conn.register_table_function::<duckdb_raster::RsMetadataVTab>("rs_metadata")?;
-    conn.register_table_function::<duckdb_raster::S2CoveringVTab>("s2_covering")?;
-    conn.register_table_function::<duckdb_raster::S2ChildrenVTab>("s2_children")?;
-    conn.register_table_function::<duckdb_raster::S2NeighborsVTab>("s2_cell_neighbors")?;
-    conn.register_table_function::<duckdb_raster::RsStatsVTab>("rs_stats")?;
-    conn.register_table_function::<duckdb_raster::RsHistogramVTab>("rs_histogram")?;
-    conn.register_scalar_function::<duckdb_raster::RsBandCount>("rs_band_count")?;
-    conn.register_scalar_function::<duckdb_raster::RsWidth>("rs_width")?;
-    conn.register_scalar_function::<duckdb_raster::RsHeight>("rs_height")?;
-    conn.register_scalar_function::<duckdb_raster::RsGeoTransform>("rs_geo_transform")?;
-    conn.register_scalar_function::<duckdb_raster::RsPixelToWorld>("rs_pixel_to_world")?;
-    conn.register_scalar_function::<duckdb_raster::RsWorldToPixel>("rs_world_to_pixel")?;
-    conn.register_scalar_function::<duckdb_raster::S2CellVertex>("s2_cell_vertex")?;
-    conn.register_scalar_function::<duckdb_raster::S2CellIdFromPoint>("s2_cell_id_from_point")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2CellId>("s2_cell_id")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2Contains>("s2_contains")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2Distance>("s2_distance_meters")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2Area>("s2_area_m2")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2Parent>("s2_parent")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2CellLevel>("s2_cell_level")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2ToGeo>("s2_to_geo")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2CellToHex>("s2_cell_to_hex")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2HexToCell>("s2_hex_to_cell")?;
+    conn.register_scalar_function::<duckdb_raster::raster_scalar::RsValue>("rs_value")?;
+    conn.register_table_function::<duckdb_raster::raster_table::RsMetadataVTab>("rs_metadata")?;
+    conn.register_table_function::<duckdb_raster::s2_table::S2CoveringVTab>("s2_covering")?;
+    conn.register_table_function::<duckdb_raster::s2_table::S2ChildrenVTab>("s2_children")?;
+    conn.register_table_function::<duckdb_raster::s2_table::S2NeighborsVTab>("s2_cell_neighbors")?;
+    conn.register_table_function::<duckdb_raster::raster_table::RsStatsVTab>("rs_stats")?;
+    conn.register_table_function::<duckdb_raster::raster_table::RsHistogramVTab>("rs_histogram")?;
+    conn.register_scalar_function::<duckdb_raster::raster_scalar::RsBandCount>("rs_band_count")?;
+    conn.register_scalar_function::<duckdb_raster::raster_scalar::RsWidth>("rs_width")?;
+    conn.register_scalar_function::<duckdb_raster::raster_scalar::RsHeight>("rs_height")?;
+    conn.register_scalar_function::<duckdb_raster::raster_scalar::RsGeoTransform>(
+        "rs_geo_transform",
+    )?;
+    conn.register_scalar_function::<duckdb_raster::raster_scalar::RsPixelToWorld>(
+        "rs_pixel_to_world",
+    )?;
+    conn.register_scalar_function::<duckdb_raster::raster_scalar::RsWorldToPixel>(
+        "rs_world_to_pixel",
+    )?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2CellVertex>("s2_cell_vertex")?;
+    conn.register_scalar_function::<duckdb_raster::s2_scalar::S2CellIdFromPoint>(
+        "s2_cell_id_from_point",
+    )?;
     Ok(conn)
 }
 
@@ -92,19 +98,6 @@ fn test_s2_parent() {
         })
         .unwrap();
     assert!(parent > 0 && parent != cell);
-}
-
-#[test]
-fn test_st_transform_coords() {
-    let conn = setup_conn().unwrap();
-    let result: String = conn
-        .query_row(
-            "SELECT st_transform_coords(116.4, 39.9, 'EPSG:4326', 'EPSG:3857')",
-            [],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(result.starts_with("POINT"), "Got: {}", result);
 }
 
 #[test]
