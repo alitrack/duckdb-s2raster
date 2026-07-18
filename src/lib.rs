@@ -271,166 +271,218 @@ fn st_transform_impl(wkt_str: &str, from_crs: &str, to_crs: &str) -> String {
 // ─── GeoTIFF Raster ────────────────────────────────────────────────────────
 
 mod raster {
+    use std::collections::HashMap;
     use std::fs::File;
     use std::io::BufReader;
+    use std::sync::{LazyLock, Mutex};
     use tiff::decoder::{Decoder, DecodingResult};
     use tiff::tags::Tag;
 
-    fn open_tiff(path: &str) -> Result<Decoder<BufReader<File>>, String> {
-        let file = File::open(path).map_err(|e| format!("Cannot open: {}", e))?;
-        Decoder::new(BufReader::new(file)).map_err(|e| format!("TIFF: {}", e))
+    /// Cached raster data — avoids re-opening TIFF on every function call
+    struct CachedRaster {
+        pixels: Vec<f64>,
+        width: u32,
+        height: u32,
+        bands: u32,
+        geo_transform: (f64, f64, f64, f64, f64, f64),
+        nodata: f64,
+        crs: String,
     }
 
-    pub fn read_dimensions(path: &str) -> Result<(u32, u32), String> {
-        let mut d = open_tiff(path)?;
-        d.dimensions().map_err(|e| format!("{}", e))
-    }
+    static CACHE: LazyLock<Mutex<HashMap<String, CachedRaster>>> =
+        LazyLock::new(|| Mutex::new(HashMap::new()));
 
-    pub fn read_band_count(path: &str) -> Result<u32, String> {
-        let mut d = open_tiff(path)?;
-        Ok(d.find_tag_unsigned::<u32>(Tag::SamplesPerPixel)
-            .ok()
-            .flatten()
-            .unwrap_or(1))
-    }
-
-    pub fn read_width(path: &str) -> Result<u32, String> {
-        let (w, _) = read_dimensions(path)?;
-        Ok(w)
-    }
-
-    pub fn read_height(path: &str) -> Result<u32, String> {
-        let (_, h) = read_dimensions(path)?;
-        Ok(h)
-    }
-
-    pub fn read_nodata(path: &str, band: u32) -> Result<f64, String> {
-        let mut d = open_tiff(path)?;
-        // Try GDAL_NODATA tag (42113) as ASCII
-        if let Ok(s) = d.get_tag_ascii_string(Tag::Unknown(42113)) {
-            return s.parse::<f64>().map_err(|_| "Invalid NoData value".into());
+    fn load_raster(path: &str) -> Result<&CachedRaster, String> {
+        // Use a block to limit lock scope
+        {
+            let cache = CACHE.lock().map_err(|e| format!("Lock: {}", e))?;
+            if cache.contains_key(path) {
+                // SAFETY: we return a reference that lives as long as the cache.
+                // This works because CACHE is static and we know the entry exists.
+                // But Rust borrow checker won't allow returning a ref from the Mutex guard.
+                // So we use unsafe to work around this.
+                return Ok(unsafe { &*(cache.get(path).unwrap() as *const CachedRaster) });
+            }
         }
-        // Fallback: try per-sample NoData via SampleFormat hint
-        let b = d
+
+        // Load from file
+        let file = File::open(path).map_err(|e| format!("Cannot open: {}", e))?;
+        let reader = BufReader::new(file);
+        let mut decoder = Decoder::new(reader).map_err(|e| format!("TIFF: {}", e))?;
+        let (w, h) = decoder.dimensions().map_err(|e| format!("{}", e))?;
+        let bands = decoder
             .find_tag_unsigned::<u32>(Tag::SamplesPerPixel)
             .ok()
             .flatten()
             .unwrap_or(1);
-        if band > b {
-            return Err("Band out of range".into());
-        }
-        // Try to find a NoData in the GDAL metadata
-        if let Ok(meta) = d.get_tag_ascii_string(Tag::Unknown(42112)) {
+
+        // GeoTransform
+        let tiepoint = decoder
+            .get_tag_f64_vec(Tag::ModelTiepointTag)
+            .unwrap_or(vec![0.0; 6]);
+        let scale = decoder
+            .get_tag_f64_vec(Tag::ModelPixelScaleTag)
+            .unwrap_or(vec![1.0, 1.0, 0.0]);
+        let gt = (
+            tiepoint.get(3).copied().unwrap_or(0.0),
+            scale.get(0).copied().unwrap_or(1.0),
+            0.0,
+            tiepoint.get(4).copied().unwrap_or(0.0),
+            0.0,
+            -scale.get(1).copied().unwrap_or(1.0),
+        );
+
+        // NoData
+        let nodata = if let Ok(s) = decoder.get_tag_ascii_string(Tag::Unknown(42113)) {
+            s.parse::<f64>().unwrap_or(f64::NAN)
+        } else if let Ok(meta) = decoder.get_tag_ascii_string(Tag::Unknown(42112)) {
+            let mut nd = f64::NAN;
             for line in meta.lines() {
-                if line.contains("NODATA") || line.contains("NoData") {
+                if (line.contains("NODATA") || line.contains("NoData")) && nd.is_nan() {
                     if let Some(v) = line.split('=').nth(1) {
-                        if let Ok(f) = v.trim().parse::<f64>() {
-                            return Ok(f);
+                        nd = v.trim().parse::<f64>().unwrap_or(f64::NAN);
+                    }
+                }
+            }
+            nd
+        } else {
+            f64::NAN
+        };
+
+        // CRS from GeoKeyDirectory
+        let crs = read_crs(&mut decoder);
+
+        // Pixels
+        let img = decoder.read_image().map_err(|e| format!("Read: {}", e))?;
+        let np = (w as usize) * (h as usize);
+        let pixels: Vec<f64> = match img {
+            DecodingResult::F64(data) => data[..np.min(data.len())].to_vec(),
+            DecodingResult::F32(data) => data.iter().take(np).map(|&v| v as f64).collect(),
+            DecodingResult::U16(data) => data.iter().take(np).map(|&v| v as f64).collect(),
+            DecodingResult::U8(data) => data.iter().take(np).map(|&v| v as f64).collect(),
+            _ => return Err("Unsupported pixel type".into()),
+        };
+
+        let raster = CachedRaster {
+            pixels,
+            width: w,
+            height: h,
+            bands,
+            geo_transform: gt,
+            nodata,
+            crs,
+        };
+        let mut cache = CACHE.lock().map_err(|e| format!("Lock: {}", e))?;
+        cache.insert(path.to_string(), raster);
+        Ok(unsafe { &*(cache.get(path).unwrap() as *const CachedRaster) })
+    }
+
+    fn read_crs(decoder: &mut Decoder<BufReader<File>>) -> String {
+        // Try to get GeoKeyDirectoryTag (34735)
+        if let Ok(keys) = decoder.get_tag_u16_vec(Tag::GeoKeyDirectoryTag) {
+            if keys.len() >= 4 {
+                let num_keys = keys[3] as usize;
+                for i in 0..num_keys {
+                    let base = 4 + i * 4;
+                    if base + 3 < keys.len() {
+                        let key_id = keys[base];
+                        if key_id == 3072 {
+                            // ProjectedCRSGeoKey
+                            return format!("EPSG:{}", keys[base + 3]);
+                        }
+                        if key_id == 2048 {
+                            // GeographicCRSGeoKey
+                            return format!("EPSG:{}", keys[base + 3]);
                         }
                     }
                 }
             }
         }
-        Ok(f64::NAN)
+        "See GeoTIFF tags".to_string()
     }
 
-    /// Returns (gt0, gt1, gt2, gt3, gt4, gt5) affine geotransform
-    pub fn read_geo_transform(path: &str) -> Result<(f64, f64, f64, f64, f64, f64), String> {
-        let mut d = open_tiff(path)?;
-        // ModelTiepointTag (33922): 6 doubles: I,J,K,X,Y,Z
-        let tiepoint = d
-            .get_tag_f64_vec(Tag::ModelTiepointTag)
-            .unwrap_or(vec![0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
-        let scale = d
-            .get_tag_f64_vec(Tag::ModelPixelScaleTag)
-            .unwrap_or(vec![1.0, 1.0, 0.0]);
+    fn get_cached(path: &str) -> Result<&CachedRaster, String> {
+        let cache = CACHE.lock().map_err(|e| format!("Lock: {}", e))?;
+        if let Some(r) = cache.get(path) {
+            Ok(unsafe { &*(r as *const CachedRaster) })
+        } else {
+            drop(cache);
+            load_raster(path)
+        }
+    }
 
-        let gt0 = tiepoint.get(3).copied().unwrap_or(0.0);
-        let gt1 = scale.get(0).copied().unwrap_or(1.0);
-        let gt2 = 0.0;
-        let gt3 = tiepoint.get(4).copied().unwrap_or(0.0);
-        let gt4 = 0.0;
-        let gt5 = -scale.get(1).copied().unwrap_or(1.0);
-        Ok((gt0, gt1, gt2, gt3, gt4, gt5))
+    pub fn read_dimensions(path: &str) -> Result<(u32, u32), String> {
+        let r = get_cached(path)?;
+        Ok((r.width, r.height))
+    }
+
+    pub fn read_band_count(path: &str) -> Result<u32, String> {
+        let r = get_cached(path)?;
+        Ok(r.bands)
+    }
+
+    pub fn read_width(path: &str) -> Result<u32, String> {
+        Ok(get_cached(path)?.width)
+    }
+
+    pub fn read_height(path: &str) -> Result<u32, String> {
+        Ok(get_cached(path)?.height)
+    }
+
+    pub fn read_nodata(path: &str, _band: u32) -> Result<f64, String> {
+        Ok(get_cached(path)?.nodata)
+    }
+
+    pub fn read_geo_transform(path: &str) -> Result<(f64, f64, f64, f64, f64, f64), String> {
+        Ok(get_cached(path)?.geo_transform)
+    }
+
+    pub fn read_scale_x(path: &str) -> Result<f64, String> {
+        Ok(get_cached(path)?.geo_transform.1)
+    }
+
+    pub fn read_scale_y(path: &str) -> Result<f64, String> {
+        Ok(get_cached(path)?.geo_transform.5.abs())
+    }
+
+    pub fn read_crs_str(path: &str) -> Result<String, String> {
+        Ok(get_cached(path)?.crs.clone())
     }
 
     pub fn pixel_to_world(path: &str, col: f64, row: f64) -> Result<(f64, f64), String> {
-        let (gt0, gt1, gt2, gt3, gt4, gt5) = read_geo_transform(path)?;
-        let x = gt0 + col * gt1 + row * gt2;
-        let y = gt3 + col * gt4 + row * gt5;
+        let gt = get_cached(path)?.geo_transform;
+        let x = gt.0 + col * gt.1 + row * gt.2;
+        let y = gt.3 + col * gt.4 + row * gt.5;
         Ok((x, y))
     }
 
     pub fn world_to_pixel(path: &str, x: f64, y: f64) -> Result<(f64, f64), String> {
-        let (gt0, gt1, gt2, gt3, gt4, gt5) = read_geo_transform(path)?;
-        let det = gt1 * gt5 - gt2 * gt4;
+        let gt = get_cached(path)?.geo_transform;
+        let det = gt.1 * gt.5 - gt.2 * gt.4;
         if det.abs() < 1e-12 {
             return Err("Singular transform".into());
         }
-        let col = (gt5 * (x - gt0) - gt2 * (y - gt3)) / det;
-        let row = (-gt4 * (x - gt0) + gt1 * (y - gt3)) / det;
+        let col = (gt.5 * (x - gt.0) - gt.2 * (y - gt.3)) / det;
+        let row = (-gt.4 * (x - gt.0) + gt.1 * (y - gt.3)) / det;
         Ok((col, row))
     }
 
-    pub fn read_all_pixels(path: &str, band: u32) -> Result<Vec<f64>, String> {
-        let file = File::open(path).map_err(|e| format!("Cannot open: {}", e))?;
-        let reader = BufReader::new(file);
-        let mut decoder = Decoder::new(reader).map_err(|e| format!("TIFF: {}", e))?;
-        let (w, h) = decoder.dimensions().map_err(|e| format!("{}", e))?;
-        let b = decoder
-            .find_tag_unsigned::<u32>(Tag::SamplesPerPixel)
-            .ok()
-            .flatten()
-            .unwrap_or(1);
-        if band > b {
-            return Err("Band out of range".into());
+    pub fn read_all_pixels(path: &str, _band: u32) -> Result<Vec<f64>, String> {
+        Ok(get_cached(path)?.pixels.clone())
+    }
+
+    pub fn read_pixel(path: &str, _band: u32, col: u32, row: u32) -> Result<f64, String> {
+        let r = get_cached(path)?;
+        if col >= r.width || row >= r.height {
+            return Err("Pixel out of bounds".into());
         }
-        let img = decoder.read_image().map_err(|e| format!("Read: {}", e))?;
-        let offset = band.saturating_sub(1) as usize * (w as usize * h as usize);
-        let end = offset + (w as usize * h as usize);
-        match img {
-            DecodingResult::F64(data) => Ok(data[offset..end.min(data.len())].to_vec()),
-            DecodingResult::F32(data) => Ok(data[offset..end.min(data.len())]
-                .iter()
-                .map(|&v| v as f64)
-                .collect()),
-            DecodingResult::U16(data) => Ok(data[offset..end.min(data.len())]
-                .iter()
-                .map(|&v| v as f64)
-                .collect()),
-            DecodingResult::U8(data) => Ok(data[offset..end.min(data.len())]
-                .iter()
-                .map(|&v| v as f64)
-                .collect()),
-            _ => Err("Unsupported pixel type".into()),
-        }
+        let idx = (row as usize) * (r.width as usize) + (col as usize);
+        Ok(r.pixels.get(idx).copied().unwrap_or(f64::NAN))
     }
 
     pub fn read_metadata(path: &str) -> Result<(u32, u32, u32, String), String> {
-        let (w, h) = read_dimensions(path)?;
-        let bands = read_band_count(path)?;
-        let crs = "See GeoTIFF tags".to_string();
-        Ok((w, h, bands, crs))
-    }
-
-    pub fn read_pixel(path: &str, band: u32, col: u32, row: u32) -> Result<f64, String> {
-        let file = File::open(path).map_err(|e| format!("Cannot open: {}", e))?;
-        let reader = BufReader::new(file);
-        let mut decoder = Decoder::new(reader).map_err(|e| format!("TIFF: {}", e))?;
-        let (width, height) = decoder.dimensions().map_err(|e| format!("{}", e))?;
-        if col >= width || row >= height {
-            return Err("Pixel out of bounds".into());
-        }
-        let img = decoder.read_image().map_err(|e| format!("Read: {}", e))?;
-        let idx = (row as usize * width as usize + col as usize)
-            + band.saturating_sub(1) as usize * (width as usize * height as usize);
-        match img {
-            DecodingResult::F64(data) => Ok(*data.get(idx).unwrap_or(&f64::NAN)),
-            DecodingResult::F32(data) => Ok(*data.get(idx).unwrap_or(&0.0) as f64),
-            DecodingResult::U16(data) => Ok(*data.get(idx).unwrap_or(&0) as f64),
-            DecodingResult::U8(data) => Ok(*data.get(idx).unwrap_or(&0) as f64),
-            _ => Ok(f64::NAN),
-        }
+        let r = get_cached(path)?;
+        Ok((r.width, r.height, r.bands, r.crs.clone()))
     }
 }
 
@@ -915,6 +967,184 @@ impl VArrowScalar for RsWorldToPixel {
     }
 }
 
+// ─── Raster convenience scalars ────────────────────────────────────────────
+
+pub struct RsScaleX;
+impl VArrowScalar for RsScaleX {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let path = input
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut b = Float64Array::builder(path.len());
+        for i in 0..path.len() {
+            b.append_value(raster::read_scale_x(path.value(i)).unwrap_or(1.0));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8],
+            DataType::Float64,
+        )]
+    }
+}
+
+pub struct RsScaleY;
+impl VArrowScalar for RsScaleY {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let path = input
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut b = Float64Array::builder(path.len());
+        for i in 0..path.len() {
+            b.append_value(raster::read_scale_y(path.value(i)).unwrap_or(1.0));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8],
+            DataType::Float64,
+        )]
+    }
+}
+
+pub struct RsCrs;
+impl VArrowScalar for RsCrs {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let path = input
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut b = StringBuilder::with_capacity(path.len(), 20);
+        for i in 0..path.len() {
+            b.append_value(raster::read_crs_str(path.value(i)).unwrap_or_default());
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8],
+            DataType::Utf8,
+        )]
+    }
+}
+
+pub struct RsMin;
+impl VArrowScalar for RsMin {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let path = input
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut b = Float64Array::builder(path.len());
+        for i in 0..path.len() {
+            let p = raster::read_all_pixels(path.value(i), 1).unwrap_or_default();
+            b.append_value(p.iter().cloned().fold(f64::INFINITY, f64::min));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8],
+            DataType::Float64,
+        )]
+    }
+}
+
+pub struct RsMax;
+impl VArrowScalar for RsMax {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let path = input
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut b = Float64Array::builder(path.len());
+        for i in 0..path.len() {
+            let p = raster::read_all_pixels(path.value(i), 1).unwrap_or_default();
+            b.append_value(p.iter().cloned().fold(f64::NEG_INFINITY, f64::max));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8],
+            DataType::Float64,
+        )]
+    }
+}
+
+pub struct RsMean;
+impl VArrowScalar for RsMean {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let path = input
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut b = Float64Array::builder(path.len());
+        for i in 0..path.len() {
+            let p = raster::read_all_pixels(path.value(i), 1).unwrap_or_default();
+            let m = if p.is_empty() {
+                f64::NAN
+            } else {
+                p.iter().sum::<f64>() / p.len() as f64
+            };
+            b.append_value(m);
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8],
+            DataType::Float64,
+        )]
+    }
+}
+
+pub struct RsStddev;
+impl VArrowScalar for RsStddev {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let path = input
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .unwrap();
+        let mut b = Float64Array::builder(path.len());
+        for i in 0..path.len() {
+            let p = raster::read_all_pixels(path.value(i), 1).unwrap_or_default();
+            let s = if p.is_empty() {
+                f64::NAN
+            } else {
+                let mean = p.iter().sum::<f64>() / p.len() as f64;
+                (p.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / p.len() as f64).sqrt()
+            };
+            b.append_value(s);
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(
+            vec![DataType::Utf8],
+            DataType::Float64,
+        )]
+    }
+}
+
 // ─── Table Functions ────────────────────────────────────────────────────────
 
 // rs_metadata
@@ -1380,6 +1610,13 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_scalar_function::<RsGeoTransform>("rs_geo_transform")?;
     con.register_scalar_function::<RsPixelToWorld>("rs_pixel_to_world")?;
     con.register_scalar_function::<RsWorldToPixel>("rs_world_to_pixel")?;
+    con.register_scalar_function::<RsScaleX>("rs_scale_x")?;
+    con.register_scalar_function::<RsScaleY>("rs_scale_y")?;
+    con.register_scalar_function::<RsCrs>("rs_crs")?;
+    con.register_scalar_function::<RsMin>("rs_min")?;
+    con.register_scalar_function::<RsMax>("rs_max")?;
+    con.register_scalar_function::<RsMean>("rs_mean")?;
+    con.register_scalar_function::<RsStddev>("rs_stddev")?;
     con.register_table_function::<RsMetadataVTab>("rs_metadata")?;
     con.register_table_function::<RsStatsVTab>("rs_stats")?;
     con.register_table_function::<RsHistogramVTab>("rs_histogram")?;
