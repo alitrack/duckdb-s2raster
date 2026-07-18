@@ -1578,6 +1578,156 @@ impl VTab for RsHistogramVTab {
     }
 }
 
+// ─── s2_interior_covering ──────────────────────────────────────────────────
+
+pub struct S2InteriorCoveringVTab;
+#[repr(C)] pub struct S2InteriorCoveringInit { done: AtomicBool }
+#[repr(C)] pub struct S2InteriorCoveringBind { cells: Vec<i64> }
+
+fn interior_covering_from_wkt(wkt_str: &str, min_level: i32, max_level: i32, max_cells: usize) -> Vec<i64> {
+    use geo::algorithm::BoundingRect;
+    use geo::Geometry;
+    use s2::region::RegionCoverer;
+    use wkt::TryFromWkt;
+    let geom = match Geometry::<f64>::try_from_wkt_str(wkt_str) { Ok(g) => g, Err(_) => return vec![] };
+    let bbox = match geom.bounding_rect() { Some(r) => r, None => return vec![] };
+    let rect = s2::rect::Rect::from_degrees(bbox.min().y, bbox.min().x, bbox.max().y, bbox.max().x);
+    let coverer = RegionCoverer { min_level: min_level.max(0) as u8, max_level: max_level.min(30) as u8, level_mod: 1, max_cells };
+    let cu = coverer.interior_covering(&rect);
+    cu.0.iter().map(|cid| cid.0 as i64).collect()
+}
+
+impl VTab for S2InteriorCoveringVTab {
+    type BindData = S2InteriorCoveringBind; type InitData = S2InteriorCoveringInit;
+    fn bind(bind: &BindInfo) -> Result<Self::BindData, Box<dyn Error>> {
+        bind.add_result_column("cell_id", LogicalTypeHandle::from(LogicalTypeId::Bigint));
+        let wkt = bind.get_parameter(0).to_string();
+        let min_lvl: i32 = bind.get_parameter(1).to_int32();
+        let max_lvl: i32 = bind.get_parameter(2).to_int32();
+        let max_cells: usize = bind.get_parameter(3).to_int32().max(4) as usize;
+        Ok(S2InteriorCoveringBind { cells: interior_covering_from_wkt(&wkt, min_lvl, max_lvl, max_cells) })
+    }
+    fn init(_: &InitInfo) -> Result<Self::InitData, Box<dyn Error>> { Ok(S2InteriorCoveringInit { done: AtomicBool::new(false) }) }
+    fn func(func: &TableFunctionInfo<Self>, output: &mut DataChunkHandle) -> Result<(), Box<dyn Error>> {
+        if func.get_init_data().done.swap(true, Ordering::Relaxed) { output.set_len(0); return Ok(()); }
+        let bd = func.get_bind_data();
+        let ids: Int64Array = bd.cells.iter().map(|&c| c).collect();
+        let batch = RecordBatch::try_new(Arc::new(Schema::new(vec![Field::new("cell_id", DataType::Int64, false)])), vec![Arc::new(ids)])?;
+        record_batch_to_duckdb_data_chunk(&batch, output)?;
+        Ok(())
+    }
+    fn parameters() -> Option<Vec<LogicalTypeHandle>> {
+        Some(vec![LogicalTypeHandle::from(LogicalTypeId::Varchar), LogicalTypeHandle::from(LogicalTypeId::Integer), LogicalTypeHandle::from(LogicalTypeId::Integer), LogicalTypeHandle::from(LogicalTypeId::Integer)])
+    }
+}
+
+// ─── s2_cell_union BLOB helpers ────────────────────────────────────────────
+
+fn pack_cell_union(cells: &[i64]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(4 + cells.len() * 8);
+    bytes.extend_from_slice(&(cells.len() as u32).to_le_bytes());
+    for &c in cells { bytes.extend_from_slice(&(c as u64).to_le_bytes()); }
+    bytes
+}
+
+fn unpack_cell_union(blob: &[u8]) -> Vec<u64> {
+    if blob.len() < 4 { return vec![]; }
+    let count = u32::from_le_bytes([blob[0], blob[1], blob[2], blob[3]]) as usize;
+    let mut cells = Vec::with_capacity(count);
+    for i in 0..count {
+        let off = 4 + i * 8;
+        if off + 8 > blob.len() { break; }
+        cells.push(u64::from_le_bytes([blob[off], blob[off+1], blob[off+2], blob[off+3], blob[off+4], blob[off+5], blob[off+6], blob[off+7]]));
+    }
+    cells
+}
+
+/// s2_cell_union_pack(csv_hex_tokens) → BLOB
+/// Usage: SELECT s2_cell_union_pack(string_agg(s2_cell_to_hex(cid), ',')) FROM t
+pub struct S2CellUnionPack;
+impl VArrowScalar for S2CellUnionPack {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let csv = input.column(0).as_any().downcast_ref::<StringArray>().unwrap();
+        let mut b = arrow::array::BinaryBuilder::with_capacity(csv.len(), csv.len() * 64);
+        for i in 0..csv.len() {
+            let cells: Vec<i64> = csv.value(i).split(',').filter_map(|s| {
+                let s = s.trim();
+                if s.is_empty() { None }
+                else { Some(s2::cellid::CellID::from_token(s).0 as i64) }
+            }).collect();
+            b.append_value(&pack_cell_union(&cells));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(vec![DataType::Utf8], DataType::Binary)]
+    }
+}
+
+/// s2_cell_union_contains(cu_blob, cell_id) → bool
+/// Alternate: s2_cell_union_contains(s2_cell_union_pack(...), s2_cell_id(...))
+pub struct S2CellUnionContains;
+impl VArrowScalar for S2CellUnionContains {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let blob = input.column(0).as_any().downcast_ref::<arrow::array::BinaryArray>().unwrap();
+        let cell = input.column(1).as_any().downcast_ref::<Int64Array>().unwrap();
+        let mut b = BooleanArray::builder(blob.len());
+        for i in 0..blob.len() {
+            let cells = unpack_cell_union(blob.value(i));
+            let cid = s2::cellid::CellID(cell.value(i) as u64);
+            let cu = s2::cellunion::CellUnion(cells.into_iter().map(|c| s2::cellid::CellID(c)).collect());
+            b.append_value(cu.contains_cellid(&cid));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(vec![DataType::Binary, DataType::Int64], DataType::Boolean)]
+    }
+}
+
+/// s2_cell_union_intersects(blob1, blob2) → bool
+pub struct S2CellUnionIntersects;
+impl VArrowScalar for S2CellUnionIntersects {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let b1 = input.column(0).as_any().downcast_ref::<arrow::array::BinaryArray>().unwrap();
+        let b2 = input.column(1).as_any().downcast_ref::<arrow::array::BinaryArray>().unwrap();
+        let mut out = BooleanArray::builder(b1.len());
+        for i in 0..b1.len() {
+            let c1 = unpack_cell_union(b1.value(i));
+            let c2 = unpack_cell_union(b2.value(i));
+            let cu1 = s2::cellunion::CellUnion(c1.into_iter().map(|c| s2::cellid::CellID(c)).collect());
+            let cu2 = s2::cellunion::CellUnion(c2.into_iter().map(|c| s2::cellid::CellID(c)).collect());
+            out.append_value(cu1.intersects_cell_union(&cu2));
+        }
+        Ok(Arc::new(out.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(vec![DataType::Binary, DataType::Binary], DataType::Boolean)]
+    }
+}
+
+/// s2_cell_union_area(cu_blob) → m²
+pub struct S2CellUnionArea;
+impl VArrowScalar for S2CellUnionArea {
+    type State = ();
+    fn invoke(_: &(), input: RecordBatch) -> Result<Arc<dyn Array>, Box<dyn Error>> {
+        let blob = input.column(0).as_any().downcast_ref::<arrow::array::BinaryArray>().unwrap();
+        let mut b = Float64Array::builder(blob.len());
+        for i in 0..blob.len() {
+            let cells = unpack_cell_union(blob.value(i));
+            let cu = s2::cellunion::CellUnion(cells.into_iter().map(|c| s2::cellid::CellID(c)).collect());
+            b.append_value(cu.approx_area() * 6_371_009.0_f64.powi(2));
+        }
+        Ok(Arc::new(b.finish()))
+    }
+    fn signatures() -> Vec<ArrowFunctionSignature> {
+        vec![ArrowFunctionSignature::exact(vec![DataType::Binary], DataType::Float64)]
+    }
+}
+
 // ─── Entrypoint ────────────────────────────────────────────────────────────
 
 #[cfg(feature = "loadable-extension")]
@@ -1598,6 +1748,11 @@ pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>
     con.register_table_function::<S2CoveringVTab>("s2_covering")?;
     con.register_table_function::<S2ChildrenVTab>("s2_children")?;
     con.register_table_function::<S2NeighborsVTab>("s2_cell_neighbors")?;
+    con.register_table_function::<S2InteriorCoveringVTab>("s2_interior_covering")?;
+    con.register_scalar_function::<S2CellUnionPack>("s2_cell_union_pack")?;
+    con.register_scalar_function::<S2CellUnionContains>("s2_cell_union_contains")?;
+    con.register_scalar_function::<S2CellUnionIntersects>("s2_cell_union_intersects")?;
+    con.register_scalar_function::<S2CellUnionArea>("s2_cell_union_area")?;
     // ST_Transform
     con.register_scalar_function::<StTransformCoords>("st_transform_coords")?;
     con.register_scalar_function::<StTransform>("st_transform")?;
