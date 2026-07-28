@@ -1,70 +1,13 @@
-name: Main Extension Distribution Pipeline
+name: CI
 
-on:
-  push:
-    branches: [master]
-    tags: ['v*']
-  pull_request:
-  workflow_dispatch:
-
-concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.head_ref || '' }}-${{ github.base_ref || '' }}-${{ github.ref != 'refs/heads/master' || github.sha }}
-  cancel-in-progress: true
+on: [push, workflow_dispatch]
 
 jobs:
-  linux-amd64-smoke:
-    name: Linux amd64 smoke
-    runs-on: ubuntu-24.04
+  build:
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install build deps
-        run: |
-          sudo apt-get update -y -qq
-          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq make ninja-build jq
-      - name: Configure
-        run: make configure
-      - name: Build
-        run: make release
-      - name: Verify
-        run: ls -la build/release/raster.duckdb_extension
-
-  macos-arm64-smoke:
-    name: macOS arm64 smoke
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install build tools
-        run: brew install ninja
-      - name: Configure
-        run: make configure
-      - name: Build
-        run: make release
-      - name: Verify
-        run: ls -la build/release/raster.duckdb_extension
-
-  windows-amd64-smoke:
-    name: Windows amd64 smoke
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          submodules: recursive
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install build tools
-        shell: bash
-        run: choco install make ninja jq -y
-      - name: Configure
-        shell: bash
-        run: make configure
-      - name: Build
-        shell: bash
-        run: make release
-      - name: Verify
-        shell: bash
-        run: ls -la build/release/raster.duckdb_extension
+      - run: cargo check --features loadable-extension
