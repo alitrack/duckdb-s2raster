@@ -55,15 +55,16 @@ pub fn s2_cell_to_hex_impl(cell_id: i64) -> String {
     CellID(cell_id as u64).to_token()
 }
 
-pub fn s2_hex_to_cell_impl(hex: &str) -> i64 {
-    CellID::from_token(hex).0 as i64
+pub fn s2_hex_to_cell_impl(hex: &str) -> Option<i64> {
+    CellID::from_token(hex).ok().map(|c| c.0 as i64)
 }
 
-pub fn s2_cell_vertex_impl(cell_id: i64, k: i32) -> String {
+pub fn s2_cell_vertex_impl(cell_id: i64, k: i32) -> Option<String> {
     let cell: Cell = CellID(cell_id as u64).into();
+    if k < 0 || k >= 4 { return None; }
     let v = cell.vertex(k as usize);
     let ll: LatLng = v.into();
-    format!("POINT({:.7} {:.7})", ll.lng.deg(), ll.lat.deg())
+    Some(format!("POINT({:.7} {:.7})", ll.lng.deg(), ll.lat.deg()))
 }
 
 pub fn s2_cell_id_from_point_impl(wkt_str: &str) -> i64 {

@@ -92,7 +92,7 @@ impl VArrowScalar for S2HexToCell {
             .unwrap();
         let mut b = Int64Array::builder(a0.len());
         for i in 0..a0.len() {
-            b.append_value(s2_hex_to_cell_impl(a0.value(i)));
+            b.append_value(s2_hex_to_cell_impl(a0.value(i)).unwrap_or(0));
         }
         Ok(Arc::new(b.finish()))
     }
@@ -120,7 +120,7 @@ impl VArrowScalar for S2CellVertex {
             .unwrap();
         let mut b = StringBuilder::with_capacity(a0.len(), a0.len() * 40);
         for i in 0..a0.len() {
-            b.append_value(s2_cell_vertex_impl(a0.value(i), a1.value(i)));
+            b.append_value(s2_cell_vertex_impl(a0.value(i), a1.value(i)).unwrap_or_default());
         }
         Ok(Arc::new(b.finish()))
     }

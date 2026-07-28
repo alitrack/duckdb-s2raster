@@ -10,6 +10,7 @@ use tiff::tags::Tag;
 
 /// Cached raster data — avoids re-opening TIFF on every function call
 pub struct CachedRaster {
+    /// All pixels, band-interleaved (chunky): pixel at (col,row,band) = pixels[(row*w+col)*bands+band]
     pixels: Vec<f64>,
     pub width: u32,
     pub height: u32,
@@ -123,17 +124,27 @@ fn get_cached(path: &str) -> Result<Arc<CachedRaster>, String> {
 
 // ─── Public API ────────────────────────────────────────────────────────────
 
-pub fn read_pixel(path: &str, _band: u32, col: u32, row: u32) -> Result<f64, String> {
+pub fn read_pixel(path: &str, band: u32, col: u32, row: u32) -> Result<f64, String> {
     let r = get_cached(path)?;
     if col >= r.width || row >= r.height {
         return Err("Pixel out of bounds".into());
     }
-    let idx = (row as usize) * (r.width as usize) + (col as usize);
+    let b = (band - 1).min(r.bands.saturating_sub(1));
+    let idx = ((row as usize) * (r.width as usize) + (col as usize)) * (r.bands as usize) + (b as usize);
     Ok(r.pixels.get(idx).copied().unwrap_or(f64::NAN))
 }
 
-pub fn all_pixels(path: &str, _band: u32) -> Result<Vec<f64>, String> {
-    Ok(get_cached(path)?.pixels.clone())
+pub fn all_pixels(path: &str, band: u32) -> Result<Vec<f64>, String> {
+    let r = get_cached(path)?;
+    let b = (band - 1).min(r.bands.saturating_sub(1)) as usize;
+    let bands = r.bands as usize;
+    let w = r.width as usize;
+    let h = r.height as usize;
+    Ok((0..h).flat_map(|row| {
+        (0..w).map(move |col| {
+            r.pixels.get((row * w + col) * bands + b).copied().unwrap_or(f64::NAN)
+        })
+    }).collect())
 }
 
 pub fn band_count(path: &str) -> Result<u32, String> {
