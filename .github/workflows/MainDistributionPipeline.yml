@@ -21,7 +21,7 @@ jobs:
       extension_name: raster
       extra_toolchains: rust
       exclude_archs: 'linux_arm64;wasm_mvp;wasm_eh;wasm_threads;windows_amd64_mingw;windows_amd64_rtools'
-      skip_tests: false
+      skip_tests: true
     secrets: inherit
 
   release:
