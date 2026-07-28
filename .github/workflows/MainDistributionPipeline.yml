@@ -12,50 +12,59 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  duckdb-stable-build:
-    name: Build extension binaries
-    uses: duckdb/extension-ci-tools/.github/workflows/_extension_distribution.yml@v1.5-variegata
-    with:
-      duckdb_version: v1.5.4
-      ci_tools_version: v1.5-variegata
-      extension_name: raster
-      extra_toolchains: rust
-      exclude_archs: 'linux_arm64;wasm_mvp;wasm_eh;windows_amd64_mingw;windows_amd64_rtools'
-      skip_tests: true
-    secrets: inherit
-
-  release:
-    name: Create GitHub Release
-    needs: duckdb-stable-build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
+  linux-amd64-smoke:
+    name: Linux amd64 smoke
+    runs-on: ubuntu-24.04
     steps:
-      - name: Download all artifacts
-        uses: actions/download-artifact@v4
+      - uses: actions/checkout@v4
         with:
-          path: artifacts
-          merge-multiple: false
-      - name: Rename release assets
-        shell: bash
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build deps
         run: |
-          set -euo pipefail
-          mkdir -p release-assets
-          for artifact_dir in artifacts/*; do
-            [ -d "$artifact_dir" ] || continue
-            artifact_name=$(basename "$artifact_dir")
-            platform_suffix="${artifact_name##*-extension-}"
-            for asset in "$artifact_dir"/*.duckdb_extension; do
-              [ -f "$asset" ] || continue
-              asset_name=$(basename "$asset")
-              stem="${asset_name%.duckdb_extension}"
-              cp "$asset" "release-assets/${stem}-${platform_suffix}.duckdb_extension"
-            done
-          done
-          ls -la release-assets/
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+          sudo apt-get update -y -qq
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq make ninja-build jq
+      - name: Configure
+        run: make configure
+      - name: Build
+        run: make release
+      - name: Verify
+        run: ls -la build/release/raster.duckdb_extension
+
+  macos-arm64-smoke:
+    name: macOS arm64 smoke
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
         with:
-          files: release-assets/*
-          generate_release_notes: true
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build tools
+        run: brew install ninja
+      - name: Configure
+        run: make configure
+      - name: Build
+        run: make release
+      - name: Verify
+        run: ls -la build/release/raster.duckdb_extension
+
+  windows-amd64-smoke:
+    name: Windows amd64 smoke
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build tools
+        shell: bash
+        run: choco install make ninja jq -y
+      - name: Configure
+        shell: bash
+        run: make configure
+      - name: Build
+        shell: bash
+        run: make release
+      - name: Verify
+        shell: bash
+        run: ls -la build/release/raster.duckdb_extension
