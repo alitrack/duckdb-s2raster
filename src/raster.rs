@@ -140,13 +140,14 @@ pub fn all_pixels(path: &str, band: u32) -> Result<Vec<f64>, String> {
     let bands = r.bands as usize;
     let w = r.width as usize;
     let h = r.height as usize;
-    let result: Vec<f64> = (0..h).flat_map(|row| {
+    let mut result = Vec::with_capacity((w * h) as usize);
+    for row in 0..h {
         let row_offset = row * w;
-        (0..w).map(move |col| {
+        for col in 0..w {
             let idx = (row_offset + col) * bands + b;
-            r.pixels.get(idx).copied().unwrap_or(f64::NAN)
-        })
-    }).collect();
+            result.push(r.pixels.get(idx).copied().unwrap_or(f64::NAN));
+        }
+    }
     Ok(result)
 }
 
