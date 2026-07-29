@@ -56,7 +56,9 @@ pub fn s2_cell_to_hex_impl(cell_id: i64) -> String {
 }
 
 pub fn s2_hex_to_cell_impl(hex: &str) -> Option<i64> {
-    CellID::from_token(hex).ok().map(|c| c.0 as i64)
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        CellID::from_token(hex).0 as i64
+    })).ok()
 }
 
 pub fn s2_cell_vertex_impl(cell_id: i64, k: i32) -> Option<String> {

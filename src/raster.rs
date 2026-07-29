@@ -140,9 +140,13 @@ pub fn all_pixels(path: &str, band: u32) -> Result<Vec<f64>, String> {
     let bands = r.bands as usize;
     let w = r.width as usize;
     let h = r.height as usize;
+    let pixels = Arc::clone(&r);
+    // need local copy for the closure
+    drop(r);
     Ok((0..h).flat_map(|row| {
         (0..w).map(move |col| {
-            r.pixels.get((row * w + col) * bands + b).copied().unwrap_or(f64::NAN)
+            let idx = (row * w + col) * bands + b;
+            pixels.pixels.get(idx).copied().unwrap_or(f64::NAN)
         })
     }).collect())
 }
