@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 description = "DuckDB extension: S2 geography + GeoTIFF raster — pure Rust, zero system deps"
 license = "MIT"
-repository = "https://github.com/alitrack/duckdb-raster"
+repository = "https://github.com/alitrack/duckdb-s2raster"
 
 [lib]
 name = "s2raster"
