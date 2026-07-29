@@ -1,5 +1,5 @@
 extension:
-  name: raster
+  name: s2raster
   description: "S2 geography + GeoTIFF raster for DuckDB — cell covering, pixel read, stats, histogram"
   version: 0.1.0
   language: Rust

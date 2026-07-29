@@ -23,7 +23,7 @@ use std::error::Error;
 use duckdb::duckdb_entrypoint_c_api;
 
 #[cfg(feature = "loadable-extension")]
-#[duckdb_entrypoint_c_api(ext_name = "raster")]
+#[duckdb_entrypoint_c_api(ext_name = "s2raster")]
 pub unsafe fn extension_entrypoint(con: Connection) -> Result<(), Box<dyn Error>> {
     // S2 scalar
     con.register_scalar_function::<s2_scalar::S2CellId>("s2_cell_id")?;

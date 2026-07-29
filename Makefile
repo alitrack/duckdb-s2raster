@@ -2,7 +2,7 @@
 
 PROJ_DIR := $(dir $(abspath $(lastword $(MAKEFILE_LIST))))
 
-EXTENSION_NAME=raster
+EXTENSION_NAME=s2raster
 USE_UNSTABLE_C_API=0
 TARGET_DUCKDB_VERSION=v1.5.4
 
