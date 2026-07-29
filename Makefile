@@ -18,8 +18,5 @@ release: build_extension_library_release build_extension_with_metadata_release
 
 SKIP_TESTS=1
 
-# Force bundled DuckDB build — duckdb-rs loadable-extension needs libduckdb at link time
-export DUCKDB_LIB_DIR=
-
 clean: clean_build clean_rust
 clean_all: clean clean_configure
