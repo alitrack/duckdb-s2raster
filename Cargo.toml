@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/alitrack/duckdb-raster"
 
 [lib]
-name = "duckdb_raster"
+name = "s2raster"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
