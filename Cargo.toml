@@ -23,7 +23,7 @@ dashmap = "6"
 
 [features]
 default = []
-loadable-extension = ["duckdb/loadable-extension"]
+loadable-extension = ["duckdb/loadable-extension", "duckdb/bundled"]
 test-bundled = ["duckdb/bundled"]
 
 [profile.release]
